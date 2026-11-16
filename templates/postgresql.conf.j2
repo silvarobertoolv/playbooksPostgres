@@ -1,0 +1,19 @@
+# Gerenciado por Ansible. Memória total limitada também no cgroup systemd.
+port = {{ pg_port }}
+listen_addresses = '{{ pg_listen_addresses }}'
+max_connections = {{ pg_connections }}
+shared_buffers = '{{ pg_shared_mb }}MB'
+effective_cache_size = '{{ (pg_budget_mb | int * 0.6) | int }}MB'
+work_mem = '{{ pg_work_kb }}kB'
+hash_mem_multiplier = 1.0
+maintenance_work_mem = '{{ pg_maintenance_mb }}MB'
+autovacuum_work_mem = '{{ pg_maintenance_mb }}MB'
+autovacuum_max_workers = 3
+max_worker_processes = {{ pg_parallel_workers }}
+max_parallel_workers = {{ pg_parallel_workers }}
+max_parallel_workers_per_gather = 0
+password_encryption = 'scram-sha-256'
+logging_collector = on
+log_line_prefix = '%m [%p] %u@%d '
+log_connections = on
+log_disconnections = on

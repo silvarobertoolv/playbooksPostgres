@@ -1,0 +1,4 @@
+inventory/hosts.ini
+*.retry
+.ansible/
+.venv/

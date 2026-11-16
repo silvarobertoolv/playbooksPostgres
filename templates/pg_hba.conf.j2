@@ -1,0 +1,8 @@
+# Gerenciado por Ansible; acesso administrativo local via usuário Unix postgres.
+local all postgres peer
+local all all peer
+host {{ pg_database }} {{ pg_owner }} 127.0.0.1/32 scram-sha-256
+host {{ pg_database }} {{ pg_owner }} ::1/128 scram-sha-256
+{% for cidr in pg_client_cidrs %}
+host {{ pg_database }} {{ pg_owner }} {{ cidr }} scram-sha-256
+{% endfor %}

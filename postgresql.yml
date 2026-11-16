@@ -1,0 +1,352 @@
+---
+- name: Instalar PostgreSQL 17 e provisionar Keycloak
+  # O grupo postgresql vem do inventário; become executa tarefas administrativas
+  # via sudo. gather_facts coleta RAM, CPUs, distribuição e versão do Ubuntu.
+  hosts: postgresql
+  become: true
+  gather_facts: true
+  # Variáveis podem ser sobrescritas no inventário ou com -e @variaveis.yml.
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    pg_version: '17'
+    pg_cluster: main
+    pg_port: 5432
+    pg_connections: 500
+    pg_database: key_cloack_db
+    pg_owner: key_cloack_owner
+    pg_locale: pt_BR.UTF-8
+    # localhost atende aplicações na mesma máquina. Para clientes remotos,
+    # ajuste também pg_client_cidrs, firewall e proteção TLS da conexão.
+    pg_listen_addresses: localhost
+    # Adicione somente redes de clientes autorizados, nunca acesso público por padrão.
+    pg_client_cidrs: []
+    pg_credentials_file: /var/lib/postgresql/key_cloack_db.credentials.json
+    pg_config_dir: '/etc/postgresql/{{ pg_version }}/{{ pg_cluster }}'
+    pg_unit: 'postgresql@{{ pg_version }}-{{ pg_cluster }}'
+    # Usa MemTotal como orçamento estável; MemAvailable varia durante a execução.
+    pg_budget_mb: '{{ (ansible_facts.memtotal_mb | int * 0.5) | int }}'
+    # shared_buffers recebe 25% do orçamento, ou 12,5% da RAM física.
+    pg_shared_mb: '{{ (pg_budget_mb | int * 0.25) | int }}'
+    # Reserva 10% do orçamento para uma estimativa de duas operações por conexão.
+    # work_mem é por operação de consulta, não um teto por conexão.
+    # O resultado fica entre 64 KiB e 4 MiB; o teto agregado vem do systemd.
+    pg_work_kb: '{{ [64, [4096, ((pg_budget_mb | int * 0.10 * 1024) / (pg_connections | int * 2)) | int] | min] | max }}'
+    # Manutenção e cada worker de autovacuum têm seu próprio consumo de memória.
+    pg_maintenance_mb: '{{ [256, (pg_budget_mb | int * 0.05) | int] | min }}'
+    pg_parallel_workers: '{{ [8, ansible_facts.processor_vcpus | int] | min }}'
+
+  # Falha antes de alterar o servidor se os requisitos básicos não forem atendidos.
+  pre_tasks:
+    - name: Validar plataforma e parâmetros
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == 'Ubuntu'
+          - ansible_facts.distribution_version is version('22.04', '>=')
+          - ansible_facts.service_mgr == 'systemd'
+          - pg_version == '17'
+          - pg_connections | int == 500
+          - pg_budget_mb | int >= 2048
+          - pg_database is match('^[a-z_][a-z0-9_]*$')
+          - pg_owner is match('^[a-z_][a-z0-9_]*$')
+        fail_msg: 'Requer Ubuntu >=22.04, systemd e pelo menos 4 GiB de RAM. Para carga real de 500 clientes, dimensione com teste de carga.'
+
+  tasks:
+    # psycopg2 permite que os módulos Ansible acessem PostgreSQL no destino.
+    # acl auxilia a troca segura do usuário sudo para o usuário postgres.
+    - name: Instalar pré-requisitos
+      ansible.builtin.apt:
+        name: [ca-certificates, locales, postgresql-common, python3-psycopg2, acl]
+        state: present
+        update_cache: true
+
+    # O locale deve existir ANTES do initdb: ele define regras de ordenação
+    # e classificação de caracteres. UTF-8 é diferente de ISO-8859-1.
+    - name: Habilitar definição do locale brasileiro UTF-8
+      ansible.builtin.lineinfile:
+        path: /etc/locale.gen
+        regexp: '^#?\s*pt_BR.UTF-8\s+UTF-8$'
+        line: 'pt_BR.UTF-8 UTF-8'
+      register: pg_locale_definition
+
+    # Consultas não modificam estado: changed_when evita falsos avisos de mudança.
+    - name: Consultar locales disponíveis
+      ansible.builtin.command: locale -a
+      changed_when: false
+      register: pg_locales
+
+    - name: Gerar locale se necessário
+      ansible.builtin.command: locale-gen
+      when: pg_locale_definition.changed or 'pt_BR.utf8' not in pg_locales.stdout
+
+    - name: Configurar locale padrão do servidor
+      ansible.builtin.lineinfile:
+        path: /etc/default/locale
+        regexp: '^LANG='
+        line: 'LANG=pt_BR.UTF-8'
+        create: true
+        mode: '0644'
+
+    # PGDG é o repositório oficial do projeto PostgreSQL para Debian/Ubuntu.
+    # signed-by restringe a chave a esse repositório; TLS e assinatura permanecem ativos.
+    - name: Criar diretório de chaves PGDG
+      ansible.builtin.file:
+        path: /usr/share/postgresql-common/pgdg
+        state: directory
+        mode: '0755'
+
+    - name: Obter chave oficial PGDG por HTTPS
+      ansible.builtin.get_url:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        dest: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+        mode: '0644'
+        validate_certs: true
+
+    - name: Configurar repositório oficial PGDG com assinatura obrigatória
+      ansible.builtin.apt_repository:
+        repo: 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt {{ ansible_facts.distribution_release }}-pgdg main'
+        filename: pgdg
+        state: present
+
+    # A instalação do pacote normalmente cria um cluster automaticamente.
+    # Desabilitamos isso para criá-lo explicitamente com locale e checksums.
+    # Esse ajuste também afeta futuras instalações de pacotes PostgreSQL no host.
+    - name: Impedir criação automática de cluster antes de configurar locale
+      ansible.builtin.lineinfile:
+        path: /etc/postgresql-common/createcluster.conf
+        regexp: '^#?\s*create_main_cluster\s*='
+        line: 'create_main_cluster = false'
+
+    # latest atualiza a série 17 na execução, sem migrar para outra versão major.
+    # Isso não garante ausência de CVEs; revise os avisos oficiais antes do deploy.
+    # policy_rc_d=101 impede que scripts dos pacotes iniciem serviços nesta etapa.
+    - name: Instalar atualização disponível da série 17
+      ansible.builtin.apt:
+        name: ['postgresql-17', 'postgresql-client-17', 'postgresql-contrib-17']
+        state: latest
+        update_cache: true
+        policy_rc_d: 101
+      notify: Reiniciar PostgreSQL
+
+    # O teste preserva clusters existentes: não executamos initdb novamente.
+    # Os checksums detectam corrupção de páginas; não substituem backups.
+    - name: Verificar se cluster já existe
+      ansible.builtin.stat:
+        path: '{{ pg_config_dir }}/postgresql.conf'
+      register: pg_cluster_config
+
+    - name: Criar cluster com locale e checksums
+      ansible.builtin.command:
+        argv:
+          - pg_createcluster
+          - '{{ pg_version }}'
+          - '{{ pg_cluster }}'
+          - --locale=pt_BR.UTF-8
+          - --encoding=UTF8
+          - --port=5432
+          - --
+          - --data-checksums
+          - --auth-local=peer
+          - --auth-host=scram-sha-256
+      when: not pg_cluster_config.stat.exists
+
+    # Um drop-in altera apenas esta unidade do systemd, sem editar a unidade do pacote.
+    - name: Criar diretório de limites systemd
+      ansible.builtin.file:
+        path: '/etc/systemd/system/{{ pg_unit }}.service.d'
+        state: directory
+        mode: '0755'
+
+    # MemoryHigh aplica pressão antes do teto; MemoryMax limita o cgroup inteiro.
+    # MemorySwapMax=0 impede o serviço de ultrapassar o orçamento usando swap.
+    # Se a carga exceder esse teto, pode ocorrer OOM e indisponibilidade do banco.
+    - name: Limitar memória total do serviço incluindo processos filhos
+      ansible.builtin.copy:
+        dest: '/etc/systemd/system/{{ pg_unit }}.service.d/memory.conf'
+        mode: '0644'
+        content: |
+          [Service]
+          MemoryAccounting=true
+          MemoryHigh={{ (pg_budget_mb | int * 0.9) | int }}M
+          MemoryMax={{ pg_budget_mb }}M
+          MemorySwapMax=0
+      notify: Reiniciar PostgreSQL
+
+    # Templates Jinja2 transformam variáveis em arquivos de configuração no destino.
+    # notify agenda o handler apenas quando o conteúdo realmente muda.
+    - name: Configurar instância
+      ansible.builtin.template:
+        src: postgresql.conf.j2
+        dest: '{{ pg_config_dir }}/conf.d/90-managed.conf'
+        owner: postgres
+        group: postgres
+        mode: '0644'
+      notify: Reiniciar PostgreSQL
+
+    # Substitui pg_hba.conf: revise acessos existentes antes de usar em produção.
+    # peer autentica o usuário Unix local; SCRAM valida a senha dos clientes TCP.
+    - name: Configurar autenticação
+      ansible.builtin.template:
+        src: pg_hba.conf.j2
+        dest: '{{ pg_config_dir }}/pg_hba.conf'
+        owner: postgres
+        group: postgres
+        mode: '0640'
+      notify: Reiniciar PostgreSQL
+
+    - name: Habilitar e iniciar cluster
+      ansible.builtin.systemd_service:
+        name: '{{ pg_unit }}'
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # Handlers normalmente rodam no fim. Aqui antecipamos o reinício para que
+    # as próximas tarefas usem a nova porta, autenticação e limites.
+    - name: Aplicar alterações antes do provisionamento
+      ansible.builtin.meta: flush_handlers
+
+    - name: Consultar limite de memória efetivo no systemd
+      ansible.builtin.command:
+        argv: [systemctl, show, '{{ pg_unit }}', --property=MemoryMax, --value]
+      changed_when: false
+      register: pg_memory_limit
+
+    - name: Confirmar limite agregado de 50 por cento
+      ansible.builtin.assert:
+        that:
+          - pg_memory_limit.stdout | int == pg_budget_mb | int * 1024 * 1024
+
+    # Estar iniciado no systemd não basta: esperamos o PostgreSQL aceitar conexões.
+    - name: Aguardar PostgreSQL aceitar conexões
+      become_user: postgres
+      ansible.builtin.command: '/usr/lib/postgresql/17/bin/pg_isready -h /var/run/postgresql -p {{ pg_port }}'
+      register: pg_ready
+      changed_when: false
+      retries: 15
+      delay: 2
+      until: pg_ready.rc == 0
+
+    # A senha é gerada NO SERVIDOR, sem senha fixa no Git ou no controlador.
+    # creates reutiliza o arquivo nas próximas execuções. O_EXCL evita sobrescrita
+    # e 0o600 permite leitura/escrita somente ao proprietário postgres.
+    # no_log oculta entradas e saídas sensíveis nos logs do Ansible.
+    - name: Gerar credenciais persistentes no home do postgres
+      become_user: postgres
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/python3
+          - -c
+          - |
+            import json, os, secrets, sys
+            path, database, owner, port = sys.argv[1:]
+            data = dict(database=database, username=owner, password=secrets.token_urlsafe(48), host='localhost', port=int(port))
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w') as f:
+                json.dump(data, f)
+                f.write('\n')
+          - '{{ pg_credentials_file }}'
+          - '{{ pg_database }}'
+          - '{{ pg_owner }}'
+          - '{{ pg_port | string }}'
+        creates: '{{ pg_credentials_file }}'
+      no_log: true
+
+    - name: Garantir proteção do arquivo de credenciais
+      ansible.builtin.file:
+        path: '{{ pg_credentials_file }}'
+        owner: postgres
+        group: postgres
+        mode: '0600'
+
+    # slurp devolve o arquivo em base64 (transporte, não criptografia).
+    # b64decode e from_json recuperam os campos sem imprimir a senha.
+    - name: Ler credenciais sem registrar segredos
+      ansible.builtin.slurp:
+        src: '{{ pg_credentials_file }}'
+      register: pg_credentials
+      no_log: true
+
+    - name: Validar identidade das credenciais persistidas
+      ansible.builtin.assert:
+        that:
+          - (pg_credentials.content | b64decode | from_json).database == pg_database
+          - (pg_credentials.content | b64decode | from_json).username == pg_owner
+          - (pg_credentials.content | b64decode | from_json).password | length >= 32
+      no_log: true
+
+    # O usuário pode conectar e será dono da base, mas não recebe poderes de DBA.
+    # PGOPTIONS seleciona SCRAM ao definir a senha do papel.
+    - name: Criar usuário proprietário sem privilégios administrativos
+      become_user: postgres
+      community.postgresql.postgresql_user:
+        name: '{{ pg_owner }}'
+        password: '{{ (pg_credentials.content | b64decode | from_json).password }}'
+        role_attr_flags: LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE,NOREPLICATION
+        port: '{{ pg_port }}'
+      environment:
+        PGOPTIONS: '-c password_encryption=scram-sha-256'
+      no_log: true
+
+    # template0 permite criar a base com locale explícito, independentemente
+    # do locale de template1. Uma base existente incompatível exige migração.
+    - name: Criar base UTF-8 com proprietário e locale brasileiro
+      become_user: postgres
+      community.postgresql.postgresql_db:
+        name: '{{ pg_database }}'
+        owner: '{{ pg_owner }}'
+        encoding: UTF8
+        lc_collate: '{{ pg_locale }}'
+        lc_ctype: '{{ pg_locale }}'
+        template: template0
+        port: '{{ pg_port }}'
+
+    # Teste funcional: usa a senha gerada e a mesma autenticação TCP do cliente.
+    - name: Validar login TCP do proprietário na base
+      community.postgresql.postgresql_query:
+        login_host: 127.0.0.1
+        login_user: '{{ pg_owner }}'
+        login_password: '{{ (pg_credentials.content | b64decode | from_json).password }}'
+        login_db: '{{ pg_database }}'
+        port: '{{ pg_port }}'
+        query: 'SELECT current_user, current_database(), 1 AS connected'
+      changed_when: false
+      no_log: true
+
+    # SHOW/current_setting consultam o valor realmente carregado pelo servidor.
+    # Isso detecta, por exemplo, sobreposições feitas por ALTER SYSTEM.
+    - name: Consultar configuração efetiva do servidor
+      become_user: postgres
+      community.postgresql.postgresql_query:
+        login_db: '{{ pg_database }}'
+        port: '{{ pg_port }}'
+        query: >-
+          SELECT current_setting('server_version_num')::int AS version,
+          current_setting('port')::int AS port,
+          current_setting('max_connections')::int AS connections,
+          pg_size_bytes(current_setting('shared_buffers')) AS shared_bytes,
+          pg_get_userbyid(datdba) AS owner,
+          datcollate, datctype
+          FROM pg_database WHERE datname = current_database()
+      register: pg_effective
+      changed_when: false
+
+    - name: Confirmar versão, limites, owner e locale efetivos
+      ansible.builtin.assert:
+        that:
+          - pg_effective.query_result[0].version | int >= 170000
+          - pg_effective.query_result[0].version | int < 180000
+          - pg_effective.query_result[0].port | int == pg_port | int
+          - pg_effective.query_result[0].connections | int == pg_connections | int
+          - pg_effective.query_result[0].shared_bytes | int == pg_shared_mb | int * 1024 * 1024
+          - pg_effective.query_result[0].owner == pg_owner
+          - pg_effective.query_result[0].datcollate == pg_locale
+          - pg_effective.query_result[0].datctype == pg_locale
+
+  # O handler é compartilhado pelas tarefas e executa uma vez por lote de mudanças.
+  # Reinício derruba conexões existentes: use uma janela de manutenção.
+  handlers:
+    - name: Reiniciar PostgreSQL
+      ansible.builtin.systemd_service:
+        name: '{{ pg_unit }}'
+        state: restarted
+        daemon_reload: true
