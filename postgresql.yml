@@ -21,6 +21,11 @@
     # Adicione somente redes de clientes autorizados, nunca acesso público por padrão.
     pg_client_cidrs: []
     pg_credentials_file: /var/lib/postgresql/key_cloack_db.credentials.json
+    # Exportação em texto plano para configurar a aplicação externa.
+    # O JSON acima continua sendo a fonte persistente da senha, sem rotação implícita.
+    pg_application_credentials_file: /var/lib/postgresql/key_cloack_db.credentials.env
+    # Use o DNS/IP pelo qual a aplicação alcança o banco, se diferente do IP SSH.
+    pg_application_host: '{{ ansible_host | default(inventory_hostname) }}'
     pg_config_dir: '/etc/postgresql/{{ pg_version }}/{{ pg_cluster }}'
     pg_unit: 'postgresql@{{ pg_version }}-{{ pg_cluster }}'
     # Usa MemTotal como orçamento estável; MemAvailable varia durante a execução.
@@ -341,6 +346,18 @@
           - pg_effective.query_result[0].owner == pg_owner
           - pg_effective.query_result[0].datcollate == pg_locale
           - pg_effective.query_result[0].datctype == pg_locale
+
+    # Exporta somente depois de validar a conexão: contém a mesma senha do owner.
+    # O arquivo é texto plano; no_log/diff protegem apenas a saída do Ansible.
+    - name: Salvar credenciais em texto plano para a aplicação externa
+      ansible.builtin.template:
+        src: application-credentials.env.j2
+        dest: '{{ pg_application_credentials_file }}'
+        owner: postgres
+        group: postgres
+        mode: '0600'
+      no_log: true
+      diff: false
 
   # O handler é compartilhado pelas tarefas e executa uma vez por lote de mudanças.
   # Reinício derruba conexões existentes: use uma janela de manutenção.

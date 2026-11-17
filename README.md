@@ -30,10 +30,34 @@ O arquivo `ansible.cfg` também consulta a coleção preparada em `/workspace/.a
 
 ## Acesso remoto
 
+### Credenciais em texto plano
+
+Após validar a conexão com o banco, o playbook grava também
+`/var/lib/postgresql/key_cloack_db.credentials.env`, pertencente a `postgres`, com
+permissão `0600`. Ele contém `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER` e
+`PGPASSWORD` em texto plano, com a mesma senha do JSON persistente. Reexecutar o
+playbook atualiza a exportação sem gerar outra senha. Nenhum arquivo com senha
+real é enviado ao Git.
+
+Para consultar no servidor:
+
+```bash
+sudo -u postgres cat /var/lib/postgresql/key_cloack_db.credentials.env
+```
+
+Use esses valores na configuração da aplicação. `PGHOST` assume o endereço
+`ansible_host` do inventário (ou o nome do host, quando ausente); ajuste
+`pg_application_host` para o DNS/IP que a aplicação realmente utiliza. O formato
+usa atribuições compatíveis com shell; para clientes libpq, é possível carregar
+com `set -a; . /caminho/do/arquivo.env; set +a`. Outros frameworks podem exigir
+nomes de variáveis diferentes. A exportação das credenciais não habilita acesso
+remoto: configure também os parâmetros abaixo.
+
 Por padrão escuta apenas em localhost. Para uma rede privada, use um arquivo de variáveis, por exemplo:
 
 ```yaml
 pg_listen_addresses: 'localhost,10.0.0.10'
+pg_application_host: '10.0.0.10'
 pg_client_cidrs:
   - 10.0.1.0/24
 ```
