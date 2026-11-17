@@ -50,10 +50,15 @@ Use esses valores na configuração da aplicação. `PGHOST` assume o endereço
 `pg_application_host` para o DNS/IP que a aplicação realmente utiliza. O formato
 usa atribuições compatíveis com shell; para clientes libpq, é possível carregar
 com `set -a; . /caminho/do/arquivo.env; set +a`. Outros frameworks podem exigir
-nomes de variáveis diferentes. A exportação das credenciais não habilita acesso
-remoto: configure também os parâmetros abaixo.
+nomes de variáveis diferentes. Para acesso externo, use o DNS/IP do servidor,
+nunca `*` como endereço de conexão da aplicação.
 
-Por padrão escuta apenas em localhost. Para uma rede privada, use um arquivo de variáveis, por exemplo:
+Por padrão, `listen_addresses = '*'` escuta em todas as interfaces. O HBA autoriza
+qualquer origem IPv4 (`0.0.0.0/0`) e IPv6 (`::/0`), exclusivamente para a base
+`key_cloack_db` e o usuário `key_cloack_owner`, com senha SCRAM obrigatória.
+O playbook não altera firewall ou regras de rede externas ao PostgreSQL.
+
+Para restringir a uma rede privada, sobrescreva as variáveis, por exemplo:
 
 ```yaml
 pg_listen_addresses: 'localhost,10.0.0.10'

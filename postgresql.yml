@@ -15,11 +15,13 @@
     pg_database: key_cloack_db
     pg_owner: key_cloack_owner
     pg_locale: pt_BR.UTF-8
-    # localhost atende aplicações na mesma máquina. Para clientes remotos,
-    # ajuste também pg_client_cidrs, firewall e proteção TLS da conexão.
-    pg_listen_addresses: localhost
-    # Adicione somente redes de clientes autorizados, nunca acesso público por padrão.
-    pg_client_cidrs: []
+    # '*' escuta em todas as interfaces IPv4/IPv6 disponíveis no servidor.
+    pg_listen_addresses: '*'
+    # Qualquer origem pode autenticar como owner na base da aplicação via SCRAM.
+    # Essas regras não concedem acesso a outras bases nem dispensam a senha.
+    pg_client_cidrs:
+      - 0.0.0.0/0
+      - ::/0
     pg_credentials_file: /var/lib/postgresql/key_cloack_db.credentials.json
     # Exportação em texto plano para configurar a aplicação externa.
     # O JSON acima continua sendo a fonte persistente da senha, sem rotação implícita.
